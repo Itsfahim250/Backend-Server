@@ -1,243 +1,270 @@
-import json
 import os
+import json
 import uuid
 import hashlib
-from flask import Flask, request, jsonify, send_from_directory
+import time
+import requests
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-# ==========================================
-#         CONFIGURATION
-# ==========================================
-PORT = int(os.environ.get("PORT", 8080))
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+PORT = int(os.environ.get("PORT", 8080))
 
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-DEV_DATA_FILE = os.path.join(DATA_DIR, "developers.json")
-UPLOAD_FOLDER = os.path.join(DATA_DIR, "uploads")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# ==========================================
+#         MASTER SYSTEM DB (Do not change)
+# ==========================================
+SYSTEM_DB = "https://strikexo-55b1d-default-rtdb.firebaseio.com"
+
+# DEFAULT FALLBACKS (If Admin Panel is not configured yet)
+DEFAULT_CONFIG = {
+    "dbs": [
+        "https://strikexo-55b1d-default-rtdb.firebaseio.com",
+        "https://mango-tour-15f84-default-rtdb.firebaseio.com",
+        "https://smartgpt-7ca90-default-rtdb.firebaseio.com"
+    ],
+    "imgbb_key": "",
+    "cloudinary": {"cloud_name": "", "api_key": "", "api_secret": ""}
+}
 
 # ==========================================
 #         HELPER FUNCTIONS
 # ==========================================
-def load_devs():
-    if os.path.exists(DEV_DATA_FILE):
-        with open(DEV_DATA_FILE, "r") as f: return json.load(f)
-    return {}
-
-def save_devs(devs):
-    with open(DEV_DATA_FILE, "w") as f: json.dump(devs, f, indent=4)
+def safe_email(email):
+    return email.replace('.', ',')
 
 def generate_api_key(email):
     return "cn_" + hashlib.sha256(email.encode()).hexdigest()[:32]
 
-def get_dev_by_api_key(api_key):
-    devs = load_devs()
-    for email, info in devs.items():
-        if info.get('api_key') == api_key: return email, info
-    return None, None
+def get_request_data():
+    if request.is_json: return request.json or {}
+    try: return json.loads(request.data) if request.data else {}
+    except: return dict(request.form)
 
-def get_host_url():
-    return os.environ.get("RENDER_EXTERNAL_URL", "http://127.0.0.1:8080").rstrip('/')
+def get_system_config():
+    """Fetches live configuration set via Admin Panel"""
+    res = requests.get(f"{SYSTEM_DB}/system/config.json")
+    if res.status_code == 200 and res.json():
+        return res.json()
+    return DEFAULT_CONFIG
 
-def format_bytes(b):
-    if b < 1024: return f"{b} B"
-    elif b < 1024**2: return f"{b/1024:.2f} KB"
-    elif b < 1024**3: return f"{b/1024**2:.2f} MB"
-    else: return f"{b/1024**3:.2f} GB"
+def assign_db_to_user(api_key):
+    config = get_system_config()
+    active_dbs = config.get("dbs", DEFAULT_CONFIG["dbs"])
+    hash_val = int(hashlib.md5(api_key.encode()).hexdigest(), 16)
+    return active_dbs[hash_val % len(active_dbs)]
+
+def get_dev_info(api_key):
+    res = requests.get(f"{SYSTEM_DB}/developers/{api_key}.json")
+    return res.json() if res.status_code == 200 else None
 
 # ==========================================
-#         KEEP-ALIVE
+#         ADMIN PANEL API
 # ==========================================
-@app.route('/ping', methods=['GET'])
-def ping():
-    return jsonify({"status": "alive", "message": "☁️ CloudNest is running!"})
-
-@app.route('/', methods=['GET'])
-def home():
-    return jsonify({"status": "ok", "service": "CloudNest API Console", "version": "2.2"})
+@app.route('/api/admin/config', methods=['GET', 'POST', 'OPTIONS'])
+def admin_config():
+    if request.method == 'OPTIONS': return jsonify({}), 200
+    
+    if request.method == 'GET':
+        config = get_system_config()
+        return jsonify({"status": "success", "config": config})
+        
+    if request.method == 'POST':
+        data = get_request_data()
+        requests.put(f"{SYSTEM_DB}/system/config.json", json=data)
+        return jsonify({"status": "success", "message": "Global Configuration Saved!"})
 
 # ==========================================
 #         DEVELOPER AUTHENTICATION
 # ==========================================
-@app.route('/api/dev/auth', methods=['POST'])
+@app.route('/api/dev/auth', methods=['POST', 'OPTIONS'])
 def dev_auth():
-    data = request.json or {}
-    action, email, password = data.get('action'), data.get('email', '').strip().lower(), data.get('password', '').strip()
-    devs = load_devs()
+    if request.method == 'OPTIONS': return jsonify({}), 200
+    data = get_request_data()
+    action = data.get('action')
+    email = data.get('email', '').strip().lower()
+    password = data.get('password', '').strip()
+    encoded_email = safe_email(email)
     
     if action == 'register':
         name = data.get('name', '').strip()
         if not name or not email or not password: return jsonify({"status": "error", "message": "Fill all fields."})
-        if email in devs: return jsonify({"status": "error", "message": "Email already registered."})
+        check = requests.get(f"{SYSTEM_DB}/emails/{encoded_email}.json").json()
+        if check: return jsonify({"status": "error", "message": "Email already registered."})
+        
         api_key = generate_api_key(email)
-        devs[email] = {"name": name, "email": email, "password": password, "api_key": api_key, "plan": "free"}
-        save_devs(devs)
+        assigned_db = assign_db_to_user(api_key)
+        dev_data = {"name": name, "email": email, "password": password, "api_key": api_key, "plan": "free", "assigned_db": assigned_db}
+        
+        requests.put(f"{SYSTEM_DB}/developers/{api_key}.json", json=dev_data)
+        requests.put(f"{SYSTEM_DB}/emails/{encoded_email}.json", json=api_key)
         return jsonify({"status": "success", "message": "Registered!", "api_key": api_key, "name": name, "email": email, "plan": "free"})
         
     elif action == 'login':
-        if email in devs and devs[email]['password'] == password:
-            return jsonify({"status": "success", "api_key": devs[email]['api_key'], "name": devs[email]['name'], "email": email, "plan": devs[email].get('plan', 'free')})
-        return jsonify({"status": "error", "message": "Invalid email or password."})
-    return jsonify({"status": "error", "message": "Invalid action."})
+        api_key = requests.get(f"{SYSTEM_DB}/emails/{encoded_email}.json").json()
+        if api_key:
+            dev_data = requests.get(f"{SYSTEM_DB}/developers/{api_key}.json").json()
+            if dev_data and dev_data.get('password') == password:
+                return jsonify({"status": "success", "api_key": api_key, "name": dev_data['name'], "email": email, "plan": dev_data.get('plan', 'free')})
+        return jsonify({"status": "error", "message": "Invalid credentials."})
 
 # ==========================================
-#         REALTIME DATABASE API
+#         REALTIME DATABASE & APP AUTH
 # ==========================================
-@app.route('/api/db', methods=['POST'])
+# (Keep api_db and api_auth exactly as they were in previous codes. They connect to assigned_db securely.)
+@app.route('/api/db', methods=['POST', 'OPTIONS'])
 def api_db():
-    data = request.json or {}
+    if request.method == 'OPTIONS': return jsonify({}), 200
+    data = get_request_data()
     api_key, action, key = data.get('api_key'), data.get('action'), data.get('key', 'default')
+    dev_info = get_dev_info(api_key)
+    if not dev_info: return jsonify({"status": "error", "message": "Invalid API Key."})
     
-    user_id, _ = get_dev_by_api_key(api_key)
-    if not user_id: return jsonify({"status": "error", "message": "Invalid API Key."})
-
-    db_file = os.path.join(DATA_DIR, f"{api_key}_db.json")
-    db_data = json.load(open(db_file)) if os.path.exists(db_file) else {}
-
-    if action == 'save':
-        db_data[key] = data.get('data', '')
-        with open(db_file, "w") as f: json.dump(db_data, f, indent=2)
+    base_url = f"{dev_info['assigned_db']}/projects/{api_key}/db"
+    if action == 'save' or action == 'edit':
+        requests.put(f"{base_url}/{key}.json", json=data.get('data') if action == 'save' else data.get('new_data'))
         return jsonify({"status": "success", "message": "Data saved!"})
-    elif action == 'edit':
-        if key in db_data:
-            db_data[key] = data.get('new_data', '')
-            with open(db_file, "w") as f: json.dump(db_data, f, indent=2)
-            return jsonify({"status": "success", "message": "Data updated!"})
-        return jsonify({"status": "error", "message": "Key not found."})
     elif action == 'load':
-        return jsonify({"status": "success", "data": db_data.get(key)})
+        return jsonify({"status": "success", "data": requests.get(f"{base_url}/{key}.json").json()})
     elif action == 'all': 
-        return jsonify({"status": "success", "data": db_data})
+        return jsonify({"status": "success", "data": requests.get(f"{base_url}.json").json() or {}})
     elif action == 'delete':
-        if key in db_data: 
-            del db_data[key]
-            with open(db_file, "w") as f: json.dump(db_data, f, indent=2)
-            return jsonify({"status": "success", "message": "Deleted."})
-    return jsonify({"status": "error", "message": "Invalid action."})
+        requests.delete(f"{base_url}/{key}.json")
+        return jsonify({"status": "success", "message": "Deleted."})
 
-# ==========================================
-#         APP AUTHENTICATION API
-# ==========================================
-@app.route('/api/auth', methods=['POST'])
+@app.route('/api/auth', methods=['POST', 'OPTIONS'])
 def api_auth():
-    data = request.json or {}
-    api_key, action = data.get('api_key'), data.get('action')
-    username, password = data.get('username', ''), data.get('password', '')
-    
-    user_id, _ = get_dev_by_api_key(api_key)
-    if not user_id: return jsonify({"status": "error", "message": "Invalid API Key."})
+    if request.method == 'OPTIONS': return jsonify({}), 200
+    data = get_request_data()
+    api_key, action, username = data.get('api_key'), data.get('action'), safe_email(data.get('username', ''))
+    dev_info = get_dev_info(api_key)
+    if not dev_info: return jsonify({"status": "error", "message": "Invalid API Key."})
 
-    auth_file = os.path.join(DATA_DIR, f"{api_key}_auth.json")
-    auth_data = json.load(open(auth_file)) if os.path.exists(auth_file) else {}
-
+    base_url = f"{dev_info['assigned_db']}/projects/{api_key}/auth"
     if action == 'register':
-        if username in auth_data: return jsonify({"status": "error", "message": "User already exists!"})
-        auth_data[username] = {"password": password, "uid": str(uuid.uuid4())}
-        with open(auth_file, "w") as f: json.dump(auth_data, f, indent=2)
+        if requests.get(f"{base_url}/{username}.json").json(): return jsonify({"status": "error", "message": "User exists!"})
+        requests.put(f"{base_url}/{username}.json", json={"password": data.get('password'), "uid": str(uuid.uuid4())})
         return jsonify({"status": "success", "message": "Registered!"})
     elif action == 'login':
-        if username in auth_data and auth_data[username]['password'] == password:
-            return jsonify({"status": "success", "message": "Login successful", "uid": auth_data[username]['uid']})
+        user_data = requests.get(f"{base_url}/{username}.json").json()
+        if user_data and user_data.get('password') == data.get('password'):
+            return jsonify({"status": "success", "message": "Login successful", "uid": user_data['uid']})
         return jsonify({"status": "error", "message": "Invalid credentials."})
-    elif action == 'edit': # UPDATE PASSWORD ADDED HERE
-        new_password = data.get('new_password')
-        if username in auth_data and new_password:
-            auth_data[username]['password'] = new_password
-            with open(auth_file, "w") as f: json.dump(auth_data, f, indent=2)
-            return jsonify({"status": "success", "message": "Password updated!"})
-        return jsonify({"status": "error", "message": "User not found or no new password."})
-    elif action == 'all': 
-        return jsonify({"status": "success", "data": auth_data})
+    elif action == 'all':
+        res = requests.get(f"{base_url}.json").json()
+        restored = {k.replace(',', '.'): v for k, v in (res or {}).items()}
+        return jsonify({"status": "success", "data": restored})
     elif action == 'delete':
-        if username in auth_data: 
-            del auth_data[username]
-            with open(auth_file, "w") as f: json.dump(auth_data, f, indent=2)
-            return jsonify({"status": "success", "message": "User deleted."})
-    return jsonify({"status": "error", "message": "Invalid action."})
+        requests.delete(f"{base_url}/{username}.json")
+        return jsonify({"status": "success", "message": "Deleted."})
 
 # ==========================================
-#         STORAGE API
+#         STORAGE API (DYNAMIC UPLOAD)
 # ==========================================
-@app.route('/api/upload', methods=['POST'])
+def upload_to_cloudinary(file, cloud_name, api_key, api_secret):
+    """Uploads file to Cloudinary using REST API & SHA1 Signature"""
+    timestamp = str(int(time.time()))
+    string_to_sign = f"timestamp={timestamp}{api_secret}"
+    signature = hashlib.sha1(string_to_sign.encode()).hexdigest()
+    
+    payload = {"api_key": api_key, "timestamp": timestamp, "signature": signature}
+    files = {"file": file.read()}
+    url = f"https://api.cloudinary.com/v1_1/{cloud_name}/auto/upload"
+    
+    res = requests.post(url, data=payload, files=files)
+    if res.status_code == 200:
+        return res.json().get('secure_url'), res.json().get('bytes', 0)
+    return None, 0
+
+@app.route('/api/upload', methods=['POST', 'OPTIONS'])
 def api_upload():
+    if request.method == 'OPTIONS': return jsonify({}), 200
     api_key = request.form.get('api_key')
     file = request.files.get('file')
-    user_id, _ = get_dev_by_api_key(api_key)
-    if not user_id: return jsonify({"status": "error", "message": "Invalid API Key."})
-    if not file: return jsonify({"status": "error", "message": "No file provided."})
     
-    filename = secure_filename(file.filename)
-    save_name = f"{api_key}_{filename}"
-    file.save(os.path.join(UPLOAD_FOLDER, save_name))
-    return jsonify({"status": "success", "message": "File uploaded!", "url": f"{get_host_url()}/uploads/{save_name}"})
+    dev_info = get_dev_info(api_key)
+    if not dev_info: return jsonify({"status": "error", "message": "Invalid API Key."})
+    if not file: return jsonify({"status": "error", "message": "No file."})
 
-@app.route('/api/storage/list', methods=['POST'])
-def list_files():
-    api_key = request.json.get('api_key')
-    user_id, _ = get_dev_by_api_key(api_key)
-    if not user_id: return jsonify({"status": "error"})
+    filename = secure_filename(file.filename)
+    ext = filename.split('.')[-1].lower() if '.' in filename else ''
     
+    # Get Live Config
+    config = get_system_config()
+    imgbb_key = config.get("imgbb_key", "")
+    c_name = config.get("cloudinary", {}).get("cloud_name", "")
+    c_key = config.get("cloudinary", {}).get("api_key", "")
+    c_sec = config.get("cloudinary", {}).get("api_secret", "")
+
+    file_url, file_size = None, 0
+
+    # LOGIC: Images go to ImgBB (if key exists), everything else goes to Cloudinary
+    if ext in ['png', 'jpg', 'jpeg', 'gif', 'webp'] and imgbb_key:
+        res = requests.post(f"https://api.imgbb.com/1/upload?key={imgbb_key}", files={"image": file.read()})
+        if res.status_code == 200:
+            file_url = res.json()['data']['url']
+            file_size = res.json()['data']['size']
+        else: return jsonify({"status": "error", "message": "ImgBB Upload Failed. Check API Key."})
+    
+    elif c_name and c_key and c_sec:
+        file_url, file_size = upload_to_cloudinary(file, c_name, c_key, c_sec)
+        if not file_url: return jsonify({"status": "error", "message": "Cloudinary Upload Failed."})
+        
+    else:
+        return jsonify({"status": "error", "message": "Admin has not configured storage APIs yet."})
+
+    # Save metadata in User's Firebase DB
+    user_db = dev_info['assigned_db']
+    safe_name = safe_email(filename)
+    file_data = {"filename": filename, "url": file_url, "size": file_size, "ext": ext}
+    requests.put(f"{user_db}/projects/{api_key}/storage/{safe_name}.json", json=file_data)
+    
+    return jsonify({"status": "success", "message": "Uploaded!", "url": file_url})
+
+@app.route('/api/storage/list', methods=['POST', 'OPTIONS'])
+def list_files():
+    if request.method == 'OPTIONS': return jsonify({}), 200
+    api_key = get_request_data().get('api_key')
+    dev_info = get_dev_info(api_key)
+    if not dev_info: return jsonify({"status": "error"})
+    
+    res = requests.get(f"{dev_info['assigned_db']}/projects/{api_key}/storage.json").json()
     files = []
-    for f in os.listdir(UPLOAD_FOLDER):
-        if f.startswith(api_key):
-            display_name = f.replace(api_key + "_", "", 1)
-            ext = display_name.split('.')[-1].lower() if '.' in display_name else ''
-            size_bytes = os.path.getsize(os.path.join(UPLOAD_FOLDER, f))
-            files.append({"filename": f, "display_name": display_name, "ext": ext, "url": f"{get_host_url()}/uploads/{f}", "size_str": format_bytes(size_bytes)})
+    if res:
+        for k, v in res.items():
+            v['size_str'] = f"{v['size'] / 1024:.2f} KB"
+            files.append(v)
     return jsonify({"status": "success", "files": files})
 
-@app.route('/api/storage/delete', methods=['POST'])
+@app.route('/api/storage/delete', methods=['POST', 'OPTIONS'])
 def delete_file_api():
-    api_key, filename = request.json.get('api_key'), request.json.get('filename', '')
-    user_id, _ = get_dev_by_api_key(api_key)
-    if user_id and filename.startswith(api_key): 
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
-        if os.path.exists(filepath): os.remove(filepath)
-        return jsonify({"status": "success"})
+    if request.method == 'OPTIONS': return jsonify({}), 200
+    data = get_request_data()
+    api_key, filename = data.get('api_key'), data.get('filename', '')
+    dev_info = get_dev_info(api_key)
+    if dev_info:
+        requests.delete(f"{dev_info['assigned_db']}/projects/{api_key}/storage/{safe_email(filename)}.json")
+        return jsonify({"status": "success", "message": "File record deleted."})
     return jsonify({"status": "error"})
 
-@app.route('/uploads/<filename>')
-def serve_file(filename): return send_from_directory(UPLOAD_FOLDER, filename)
-
-# ==========================================
-#         USAGE & RULES & ADMIN
-# ==========================================
-@app.route('/api/usage', methods=['POST'])
+@app.route('/api/usage', methods=['POST', 'OPTIONS'])
 def usage():
-    api_key = request.json.get('api_key')
-    user_id, dev_info = get_dev_by_api_key(api_key)
-    if not user_id: return jsonify({"status": "error"})
+    if request.method == 'OPTIONS': return jsonify({}), 200
+    api_key = get_request_data().get('api_key')
+    dev_info = get_dev_info(api_key)
+    if not dev_info: return jsonify({"status": "error"})
     
-    storage_bytes = sum(os.path.getsize(os.path.join(UPLOAD_FOLDER, f)) for f in os.listdir(UPLOAD_FOLDER) if f.startswith(api_key))
-    file_count = sum(1 for f in os.listdir(UPLOAD_FOLDER) if f.startswith(api_key))
-    db_file, auth_file = os.path.join(DATA_DIR, f"{api_key}_db.json"), os.path.join(DATA_DIR, f"{api_key}_auth.json")
-    db_bytes = os.path.getsize(db_file) if os.path.exists(db_file) else 0
-    auth_data = json.load(open(auth_file)) if os.path.exists(auth_file) else {}
+    user_db = dev_info['assigned_db']
+    db_data = requests.get(f"{user_db}/projects/{api_key}/db.json").json() or {}
+    auth_data = requests.get(f"{user_db}/projects/{api_key}/auth.json").json() or {}
+    files_data = requests.get(f"{user_db}/projects/{api_key}/storage.json").json() or {}
     
-    return jsonify({"status": "success", "plan": dev_info.get('plan', 'free'), "monthly_usage": {"storage": storage_bytes, "db": db_bytes, "auth": len(auth_data)}, "file_count": file_count, "total": format_bytes(storage_bytes + db_bytes)})
-
-@app.route('/api/rules', methods=['POST'])
-def rules_api():
-    api_key, action = request.json.get('api_key'), request.json.get('action', 'get')
-    rules_file = os.path.join(DATA_DIR, f"{api_key}_rules.json")
-    default_rules = '{\n  "rules": {\n    ".read": "true",\n    ".write": "true"\n  }\n}'
-    if action == 'get': return jsonify({"status": "success", "rules": open(rules_file).read() if os.path.exists(rules_file) else default_rules})
-    elif action == 'update':
-        with open(rules_file, 'w') as f: f.write(request.json.get('rules', default_rules))
-        return jsonify({"status": "success"})
-
-@app.route('/api/admin/make-premium', methods=['POST'])
-def make_premium():
-    target_email = request.json.get('target_email', '').strip().lower()
-    devs = load_devs()
-    if target_email in devs:
-        devs[target_email]['plan'] = 'premium'
-        save_devs(devs)
-        return jsonify({"status": "success", "message": f"{target_email} upgraded to Premium!"})
-    return jsonify({"status": "error", "message": "User not found."})
+    db_bytes = len(json.dumps(db_data).encode('utf-8'))
+    file_count = len(files_data)
+    storage_bytes = sum(f.get('size', 0) for f in files_data.values())
+    
+    return jsonify({"status": "success", "plan": dev_info.get('plan', 'free'), "monthly_usage": {"storage": storage_bytes, "db": db_bytes, "auth": len(auth_data)}, "file_count": file_count, "total": f"{(storage_bytes + db_bytes) / 1024:.2f} KB"})
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=PORT, use_reloader=False)
