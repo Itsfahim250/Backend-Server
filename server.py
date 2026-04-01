@@ -4,20 +4,27 @@ import uuid
 import hashlib
 import time
 import requests
+import logging
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
+# ==========================================
+#         CONFIGURATION
+# ==========================================
+PORT = int(os.environ.get("PORT", 8080))
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-PORT = int(os.environ.get("PORT", 8080))
+
+# Disable Flask default huge HTML logs to keep server fast & clean
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
 # ==========================================
-#         MASTER SYSTEM DB (Do not change)
+#         MASTER SYSTEM DB
 # ==========================================
 SYSTEM_DB = "https://strikexo-55b1d-default-rtdb.firebaseio.com"
 
-# DEFAULT FALLBACKS (If Admin Panel is not configured yet)
 DEFAULT_CONFIG = {
     "dbs": [
         "https://strikexo-55b1d-default-rtdb.firebaseio.com",
@@ -27,6 +34,22 @@ DEFAULT_CONFIG = {
     "imgbb_key": "",
     "cloudinary": {"cloud_name": "", "api_key": "", "api_secret": ""}
 }
+
+# ==========================================
+#         GLOBAL ERROR HANDLERS (CRON FIX)
+# ==========================================
+# Prevents Flask from returning huge HTML pages on errors
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"status": "error", "message": "Endpoint not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    return jsonify({"status": "error", "message": str(e)}), 500
 
 # ==========================================
 #         HELPER FUNCTIONS
@@ -43,21 +66,37 @@ def get_request_data():
     except: return dict(request.form)
 
 def get_system_config():
-    """Fetches live configuration set via Admin Panel"""
-    res = requests.get(f"{SYSTEM_DB}/system/config.json")
-    if res.status_code == 200 and res.json():
-        return res.json()
+    try:
+        res = requests.get(f"{SYSTEM_DB}/system/config.json")
+        if res.status_code == 200 and res.json():
+            return res.json()
+    except: pass
     return DEFAULT_CONFIG
 
 def assign_db_to_user(api_key):
     config = get_system_config()
     active_dbs = config.get("dbs", DEFAULT_CONFIG["dbs"])
+    if not active_dbs: active_dbs = DEFAULT_CONFIG["dbs"]
     hash_val = int(hashlib.md5(api_key.encode()).hexdigest(), 16)
     return active_dbs[hash_val % len(active_dbs)]
 
 def get_dev_info(api_key):
-    res = requests.get(f"{SYSTEM_DB}/developers/{api_key}.json")
-    return res.json() if res.status_code == 200 else None
+    try:
+        res = requests.get(f"{SYSTEM_DB}/developers/{api_key}.json")
+        return res.json() if res.status_code == 200 else None
+    except: return None
+
+# ==========================================
+#         KEEP-ALIVE (CRON JOB ROUTES)
+# ==========================================
+@app.route('/ping', methods=['GET', 'HEAD'])
+def ping():
+    # Returning extremely lightweight text so Cron Job never fails with "output too large"
+    return "OK", 200
+
+@app.route('/', methods=['GET', 'HEAD'])
+def home():
+    return jsonify({"status": "ok", "service": "CloudNest API Console", "version": "2.4"}), 200
 
 # ==========================================
 #         ADMIN PANEL API
@@ -67,8 +106,7 @@ def admin_config():
     if request.method == 'OPTIONS': return jsonify({}), 200
     
     if request.method == 'GET':
-        config = get_system_config()
-        return jsonify({"status": "success", "config": config})
+        return jsonify({"status": "success", "config": get_system_config()})
         
     if request.method == 'POST':
         data = get_request_data()
@@ -110,9 +148,8 @@ def dev_auth():
         return jsonify({"status": "error", "message": "Invalid credentials."})
 
 # ==========================================
-#         REALTIME DATABASE & APP AUTH
+#         REALTIME DATABASE API
 # ==========================================
-# (Keep api_db and api_auth exactly as they were in previous codes. They connect to assigned_db securely.)
 @app.route('/api/db', methods=['POST', 'OPTIONS'])
 def api_db():
     if request.method == 'OPTIONS': return jsonify({}), 200
@@ -122,6 +159,7 @@ def api_db():
     if not dev_info: return jsonify({"status": "error", "message": "Invalid API Key."})
     
     base_url = f"{dev_info['assigned_db']}/projects/{api_key}/db"
+    
     if action == 'save' or action == 'edit':
         requests.put(f"{base_url}/{key}.json", json=data.get('data') if action == 'save' else data.get('new_data'))
         return jsonify({"status": "success", "message": "Data saved!"})
@@ -132,7 +170,11 @@ def api_db():
     elif action == 'delete':
         requests.delete(f"{base_url}/{key}.json")
         return jsonify({"status": "success", "message": "Deleted."})
+    return jsonify({"status": "error", "message": "Invalid action"})
 
+# ==========================================
+#         APP AUTHENTICATION API
+# ==========================================
 @app.route('/api/auth', methods=['POST', 'OPTIONS'])
 def api_auth():
     if request.method == 'OPTIONS': return jsonify({}), 200
@@ -142,6 +184,7 @@ def api_auth():
     if not dev_info: return jsonify({"status": "error", "message": "Invalid API Key."})
 
     base_url = f"{dev_info['assigned_db']}/projects/{api_key}/auth"
+    
     if action == 'register':
         if requests.get(f"{base_url}/{username}.json").json(): return jsonify({"status": "error", "message": "User exists!"})
         requests.put(f"{base_url}/{username}.json", json={"password": data.get('password'), "uid": str(uuid.uuid4())})
@@ -151,6 +194,13 @@ def api_auth():
         if user_data and user_data.get('password') == data.get('password'):
             return jsonify({"status": "success", "message": "Login successful", "uid": user_data['uid']})
         return jsonify({"status": "error", "message": "Invalid credentials."})
+    elif action == 'edit':
+        user_data = requests.get(f"{base_url}/{username}.json").json()
+        if user_data and data.get('new_password'):
+            user_data['password'] = data.get('new_password')
+            requests.put(f"{base_url}/{username}.json", json=user_data)
+            return jsonify({"status": "success", "message": "Password updated!"})
+        return jsonify({"status": "error", "message": "User not found."})
     elif action == 'all':
         res = requests.get(f"{base_url}.json").json()
         restored = {k.replace(',', '.'): v for k, v in (res or {}).items()}
@@ -158,12 +208,12 @@ def api_auth():
     elif action == 'delete':
         requests.delete(f"{base_url}/{username}.json")
         return jsonify({"status": "success", "message": "Deleted."})
+    return jsonify({"status": "error", "message": "Invalid action"})
 
 # ==========================================
-#         STORAGE API (DYNAMIC UPLOAD)
+#         STORAGE API
 # ==========================================
 def upload_to_cloudinary(file, cloud_name, api_key, api_secret):
-    """Uploads file to Cloudinary using REST API & SHA1 Signature"""
     timestamp = str(int(time.time()))
     string_to_sign = f"timestamp={timestamp}{api_secret}"
     signature = hashlib.sha1(string_to_sign.encode()).hexdigest()
@@ -172,9 +222,11 @@ def upload_to_cloudinary(file, cloud_name, api_key, api_secret):
     files = {"file": file.read()}
     url = f"https://api.cloudinary.com/v1_1/{cloud_name}/auto/upload"
     
-    res = requests.post(url, data=payload, files=files)
-    if res.status_code == 200:
-        return res.json().get('secure_url'), res.json().get('bytes', 0)
+    try:
+        res = requests.post(url, data=payload, files=files)
+        if res.status_code == 200:
+            return res.json().get('secure_url'), res.json().get('bytes', 0)
+    except: pass
     return None, 0
 
 @app.route('/api/upload', methods=['POST', 'OPTIONS'])
@@ -190,7 +242,6 @@ def api_upload():
     filename = secure_filename(file.filename)
     ext = filename.split('.')[-1].lower() if '.' in filename else ''
     
-    # Get Live Config
     config = get_system_config()
     imgbb_key = config.get("imgbb_key", "")
     c_name = config.get("cloudinary", {}).get("cloud_name", "")
@@ -199,22 +250,20 @@ def api_upload():
 
     file_url, file_size = None, 0
 
-    # LOGIC: Images go to ImgBB (if key exists), everything else goes to Cloudinary
     if ext in ['png', 'jpg', 'jpeg', 'gif', 'webp'] and imgbb_key:
-        res = requests.post(f"https://api.imgbb.com/1/upload?key={imgbb_key}", files={"image": file.read()})
-        if res.status_code == 200:
-            file_url = res.json()['data']['url']
-            file_size = res.json()['data']['size']
-        else: return jsonify({"status": "error", "message": "ImgBB Upload Failed. Check API Key."})
-    
+        try:
+            res = requests.post(f"https://api.imgbb.com/1/upload?key={imgbb_key}", files={"image": file.read()})
+            if res.status_code == 200:
+                file_url = res.json()['data']['url']
+                file_size = res.json()['data']['size']
+            else: return jsonify({"status": "error", "message": "ImgBB Upload Failed."})
+        except: return jsonify({"status": "error", "message": "ImgBB connection error."})
     elif c_name and c_key and c_sec:
         file_url, file_size = upload_to_cloudinary(file, c_name, c_key, c_sec)
         if not file_url: return jsonify({"status": "error", "message": "Cloudinary Upload Failed."})
-        
     else:
-        return jsonify({"status": "error", "message": "Admin has not configured storage APIs yet."})
+        return jsonify({"status": "error", "message": "Storage APIs not configured by admin."})
 
-    # Save metadata in User's Firebase DB
     user_db = dev_info['assigned_db']
     safe_name = safe_email(filename)
     file_data = {"filename": filename, "url": file_url, "size": file_size, "ext": ext}
@@ -248,6 +297,9 @@ def delete_file_api():
         return jsonify({"status": "success", "message": "File record deleted."})
     return jsonify({"status": "error"})
 
+# ==========================================
+#         USAGE
+# ==========================================
 @app.route('/api/usage', methods=['POST', 'OPTIONS'])
 def usage():
     if request.method == 'OPTIONS': return jsonify({}), 200
@@ -256,9 +308,12 @@ def usage():
     if not dev_info: return jsonify({"status": "error"})
     
     user_db = dev_info['assigned_db']
-    db_data = requests.get(f"{user_db}/projects/{api_key}/db.json").json() or {}
-    auth_data = requests.get(f"{user_db}/projects/{api_key}/auth.json").json() or {}
-    files_data = requests.get(f"{user_db}/projects/{api_key}/storage.json").json() or {}
+    try:
+        db_data = requests.get(f"{user_db}/projects/{api_key}/db.json").json() or {}
+        auth_data = requests.get(f"{user_db}/projects/{api_key}/auth.json").json() or {}
+        files_data = requests.get(f"{user_db}/projects/{api_key}/storage.json").json() or {}
+    except:
+        db_data, auth_data, files_data = {}, {}, {}
     
     db_bytes = len(json.dumps(db_data).encode('utf-8'))
     file_count = len(files_data)
